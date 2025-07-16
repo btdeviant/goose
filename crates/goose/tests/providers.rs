@@ -4,7 +4,7 @@ use goose::message::{Message, MessageContent};
 use goose::providers::base::Provider;
 use goose::providers::errors::ProviderError;
 use goose::providers::{
-    anthropic, azure, bedrock, databricks, google, groq, ollama, openai, openrouter, snowflake, xai,
+    anthropic, azure, bedrock, databricks, gemini_cli, google, groq, ollama, openai, openrouter, snowflake, xai,
 };
 use mcp_core::content::Content;
 use mcp_core::tool::Tool;
@@ -595,6 +595,19 @@ async fn test_sagemaker_tgi_provider() -> Result<()> {
 #[tokio::test]
 async fn test_xai_provider() -> Result<()> {
     test_provider("Xai", &["XAI_API_KEY"], None, xai::XaiProvider::default).await
+}
+
+#[tokio::test]
+async fn test_gemini_cli_provider() -> Result<()> {
+    // Gemini CLI provider requires the 'gemini' command to be available
+    // and toolshim enabled for proper function calling support
+    test_provider(
+        "Gemini CLI",
+        &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+        None,
+        gemini_cli::GeminiCliProvider::default,
+    )
+    .await
 }
 
 // Print the final test report

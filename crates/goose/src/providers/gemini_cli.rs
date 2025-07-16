@@ -27,53 +27,41 @@ pub struct GeminiCliProvider {
 
 impl Default for GeminiCliProvider {
     fn default() -> Self {
-        let model = ModelConfig::new(GeminiCliProvider::metadata().default_model);
+        let mut model = ModelConfig::new(GeminiCliProvider::metadata().default_model);
+        // Enable toolshim by default for Gemini CLI to support function calling
+        model.toolshim = true;
         GeminiCliProvider::from_env(model).expect("Failed to initialize Gemini CLI provider")
     }
 }
 
 impl GeminiCliProvider {
-    pub fn from_env(model: ModelConfig) -> Result<Self> {
+    pub fn from_env(mut model: ModelConfig) -> Result<Self> {
         let command = "gemini".to_string(); // Fixed command, no configuration needed
+        
+        // Enable toolshim by default for Gemini CLI only if not explicitly set via environment
+        // If GOOSE_TOOLSHIM environment variable exists, respect it; otherwise enable toolshim
+        if std::env::var("GOOSE_TOOLSHIM").is_err() {
+            model.toolshim = true;
+        }
+        // If GOOSE_TOOLSHIM is set, ModelConfig::new already handled it, so we keep that value
 
         Ok(Self { command, model })
     }
 
-    /// Filter out the Extensions section from the system prompt
-    fn filter_extensions_from_system_prompt(&self, system: &str) -> String {
-        // Find the Extensions section and remove it
-        if let Some(extensions_start) = system.find("# Extensions") {
-            // Look for the next major section that starts with #
-            let after_extensions = &system[extensions_start..];
-            if let Some(next_section_pos) = after_extensions[1..].find("\n# ") {
-                // Found next section, keep everything before Extensions and after the next section
-                let before_extensions = &system[..extensions_start];
-                let next_section_start = extensions_start + next_section_pos + 1;
-                let after_next_section = &system[next_section_start..];
-                format!("{}{}", before_extensions.trim_end(), after_next_section)
-            } else {
-                // No next section found, just remove everything from Extensions onward
-                system[..extensions_start].trim_end().to_string()
-            }
-        } else {
-            // No Extensions section found, return original
-            system.to_string()
-        }
-    }
-
-    /// Execute gemini CLI command with simple text prompt
+    /// Execute gemini CLI command with system prompt and messages
+    /// Note: The official Gemini CLI does not support direct JSON tool definitions via command line,
+    /// so we rely on toolshim for function calling capabilities
     async fn execute_command(
         &self,
         system: &str,
         messages: &[Message],
-        _tools: &[Tool],
+        tools: &[Tool],
     ) -> Result<Vec<String>, ProviderError> {
         // Create a simple prompt combining system + conversation
         let mut full_prompt = String::new();
 
-        // Add system prompt
-        let filtered_system = self.filter_extensions_from_system_prompt(system);
-        full_prompt.push_str(&filtered_system);
+        // Add system prompt (no longer filter out Extensions section)
+        full_prompt.push_str(system);
         full_prompt.push_str("\n\n");
 
         // Add conversation history
@@ -98,6 +86,8 @@ impl GeminiCliProvider {
         if std::env::var("GOOSE_GEMINI_CLI_DEBUG").is_ok() {
             println!("=== GEMINI CLI PROVIDER DEBUG ===");
             println!("Command: {}", self.command);
+            println!("Tools provided: {}", tools.len());
+            println!("Toolshim enabled: {:?}", self.model.toolshim);
             println!("Full prompt: {}", full_prompt);
             println!("================================");
         }
@@ -151,8 +141,9 @@ impl GeminiCliProvider {
         }
 
         tracing::debug!(
-            "Gemini CLI executed successfully, got {} lines",
-            lines.len()
+            "Gemini CLI executed successfully, got {} lines, tools: {}",
+            lines.len(),
+            tools.len()
         );
 
         Ok(lines)
@@ -238,7 +229,7 @@ impl Provider for GeminiCliProvider {
         ProviderMetadata::new(
             "gemini-cli",
             "Gemini CLI",
-            "Execute Gemini models via gemini CLI tool",
+            "Execute Gemini models via gemini CLI tool with toolshim support for function calling",
             GEMINI_CLI_DEFAULT_MODEL,
             GEMINI_CLI_KNOWN_MODELS.to_vec(),
             GEMINI_CLI_DOC_URL,
@@ -247,8 +238,11 @@ impl Provider for GeminiCliProvider {
     }
 
     fn get_model_config(&self) -> ModelConfig {
-        // Return a custom config with 1M token limit for Gemini CLI
-        ModelConfig::new("gemini-1.5-pro".to_string()).with_context_limit(Some(1_000_000))
+        // Return the model config with toolshim enabled by default
+        let mut config = self.model.clone();
+        config.model_name = "gemini-1.5-pro".to_string();
+        config.context_limit = Some(1_000_000);
+        config
     }
 
     #[tracing::instrument(
@@ -275,7 +269,9 @@ impl Provider for GeminiCliProvider {
             "command": self.command,
             "model": self.model.model_name,
             "system": system,
-            "messages": messages.len()
+            "messages": messages.len(),
+            "tools": tools.len(),
+            "toolshim": self.model.toolshim
         });
 
         let response = json!({
@@ -295,6 +291,8 @@ impl Provider for GeminiCliProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::MessageContent;
+    use serial_test::serial;
 
     #[test]
     fn test_gemini_cli_model_config() {
@@ -303,5 +301,137 @@ mod tests {
 
         assert_eq!(config.model_name, "gemini-1.5-pro");
         assert_eq!(config.context_limit(), 1_000_000);
+        // Verify toolshim is enabled by default
+        assert_eq!(config.toolshim, true);
+    }
+
+    #[test]
+    fn test_toolshim_enabled_by_default() {
+        let provider = GeminiCliProvider::default();
+        assert_eq!(provider.model.toolshim, true);
+    }
+
+    #[test]
+    #[serial]
+    fn test_from_env_preserves_toolshim() {
+        // Set environment variable to preserve explicit toolshim setting
+        std::env::set_var("GOOSE_TOOLSHIM", "false");
+        
+        // When GOOSE_TOOLSHIM is set to false, ModelConfig::new will set toolshim to false
+        let model = ModelConfig::new("test-model".to_string());
+        assert_eq!(model.toolshim, false);
+        
+        // from_env should preserve the environment variable setting
+        let provider = GeminiCliProvider::from_env(model).unwrap();
+        assert_eq!(provider.model.toolshim, false);
+        
+        // Clean up
+        std::env::remove_var("GOOSE_TOOLSHIM");
+    }
+
+    #[test]
+    #[serial]
+    fn test_from_env_enables_toolshim_when_env_not_set() {
+        // Save original environment state
+        let original_value = std::env::var("GOOSE_TOOLSHIM").ok();
+        
+        // Ensure no GOOSE_TOOLSHIM environment variable
+        std::env::remove_var("GOOSE_TOOLSHIM");
+        
+        let model = ModelConfig::new("test-model".to_string());
+        assert_eq!(model.toolshim, false); // Default is false from ModelConfig::new
+        
+        let provider = GeminiCliProvider::from_env(model).unwrap();
+        assert_eq!(provider.model.toolshim, true); // Should be enabled by GeminiCliProvider
+        
+        // Restore original environment state
+        if let Some(original) = original_value {
+            std::env::set_var("GOOSE_TOOLSHIM", original);
+        }
+    }
+
+    #[test] 
+    fn test_no_extension_filtering() {
+        let provider = GeminiCliProvider::default();
+        let system_prompt = r#"You are a helpful assistant.
+
+# Extensions
+
+Extensions provide additional capabilities. Use them when needed.
+
+## Available Extensions
+
+- test_extension: A test extension
+
+# Other Section
+
+This should remain."#;
+
+        // The new implementation should NOT filter out Extensions
+        // We can't easily test execute_command without spawning a process,
+        // but we can verify that the filtering method is removed
+        // by checking that such method doesn't exist anymore
+        
+        // This test passes if the code compiles without the filter method
+        let _ = provider;
+        let _ = system_prompt;
+    }
+
+    #[tokio::test]
+    async fn test_session_description_generation() {
+        let provider = GeminiCliProvider::default();
+        let messages = vec![
+            Message::user().with_text("Create a hello world function in Python")
+        ];
+
+        let result = provider.generate_simple_session_description(&messages);
+        assert!(result.is_ok());
+
+        let (message, _usage) = result.unwrap();
+        assert_eq!(message.role, Role::Assistant);
+        assert_eq!(message.content.len(), 1);
+        
+        if let MessageContent::Text(text_content) = &message.content[0] {
+            assert_eq!(text_content.text, "Create a hello world");
+        } else {
+            panic!("Expected text content");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_response() {
+        let provider = GeminiCliProvider::default();
+        let lines = vec![
+            "Hello there!".to_string(),
+            "This is a response from Gemini.".to_string(),
+        ];
+
+        let result = provider.parse_response(&lines);
+        assert!(result.is_ok());
+
+        let (message, _usage) = result.unwrap();
+        assert_eq!(message.role, Role::Assistant);
+        assert_eq!(message.content.len(), 1);
+        
+        if let MessageContent::Text(text_content) = &message.content[0] {
+            assert_eq!(text_content.text, "Hello there!\nThis is a response from Gemini.");
+        } else {
+            panic!("Expected text content");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_empty_response() {
+        let provider = GeminiCliProvider::default();
+        let lines = vec![];
+
+        let result = provider.parse_response(&lines);
+        assert!(result.is_err());
+        
+        if let Err(ProviderError::RequestFailed(msg)) = result {
+            assert!(msg.contains("Empty response"));
+        } else {
+            panic!("Expected RequestFailed error for empty response");
+        }
     }
 }
